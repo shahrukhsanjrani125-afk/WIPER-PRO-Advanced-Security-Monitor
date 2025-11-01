@@ -1,238 +1,287 @@
 #!/usr/bin/env bash
-# wiper_defensive_launcher.sh
-# Hardened / improved interactive launcher for WIPER_Pro.py
-# Educational / Defensive only.
+# =====================================================================
+#  WIPER PRO — Defensive / Educational Wi-Fi Monitor Suite
+#  Version: v4.2 (Stable Clean Edition)
+#  Author: Muhammad Shahrukh
+#  Mode: Defensive | Educational | Non-offensive
+#  License: MIT-style (educational, non-commercial)
+# =====================================================================
 
 set -euo pipefail
 IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DETECTOR="WIPER_Pro.py"
 LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p "$LOG_DIR"
+DETECTOR_VERSION="WIPER_PRO_v4.2"
 
-# Colors (only if output is a TTY)
+# ---------- COLORS ----------
 if [ -t 1 ]; then
-  YELLOW=$'\033[1;33m'
-  GREEN=$'\033[1;32m'
-  RED=$'\033[1;31m'
-  RESET=$'\033[0m'
+  YELLOW=$'\033[1;33m'; GREEN=$'\033[1;32m'; RED=$'\033[1;31m'; RESET=$'\033[0m'
 else
-  YELLOW="" ; GREEN="" ; RED="" ; RESET=""
+  YELLOW=""; GREEN=""; RED=""; RESET=""
 fi
 
-# State for cleanup
-ORIG_IFACE_STATE=""
-IFACE_CHANGED=false
-MON_IFACE=""
+# ---------- UTILS ----------
+die(){ echo -e "${RED}ERROR:${RESET} $*" >&2; exit 1; }
+info(){ echo -e "${GREEN}$*${RESET}"; }
+warn(){ echo -e "${YELLOW}$*${RESET}"; }
 
-function die() {
-    echo -e "${RED}ERROR:${RESET} $*" >&2
-    exit 1
+check_tool(){ command -v "$1" >/dev/null 2>&1; }
+
+ensure_root_prompt(){
+  if [ "$(id -u)" -ne 0 ]; then
+    warn "Note: Some actions (sniffing, monitor mode) may require sudo privileges."
+  fi
 }
 
-function banner() {
-    if command -v figlet &>/dev/null; then
-        figlet WIPER
-    else
-        echo "=== WIPER PRO (Defensive Edu Edition) ==="
-    fi
-    echo "Educational / Defensive Only. Use on your own lab or with permission."
-    echo "Logs: $LOG_DIR"
-    echo
+# ---------- BANNER ----------
+banner(){
+  clear
+  if command -v figlet &>/dev/null; then
+    figlet -w 120 -f slant "WIPER PRO"
+  else
+    echo "=== WIPER PRO (Defensive Edu Edition) ==="
+  fi
+  echo "Version: $DETECTOR_VERSION"
+  echo "Educational / Defensive Use Only (Wi-Fi anomaly monitoring)"
+  echo "Logs: $LOG_DIR"
+  echo
 }
 
-function check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "Note: some actions require root. The launcher will call sudo as needed."
-    fi
+# ---------- DEPENDENCY CHECK ----------
+check_dependencies(){
+  local deps=(python3 ip iw airmon-ng tcpdump airodump-ng)
+  local missing=()
+  for d in "${deps[@]}"; do
+    if ! check_tool "$d"; then missing+=("$d"); fi
+  done
+
+  if [ "${#missing[@]}" -ne 0 ]; then
+    warn "Missing tools: ${missing[*]}"
+    warn "Offline PCAP analysis will still work (requires python3 + scapy)."
+  else
+    info "All required tools found."
+  fi
 }
 
-function check_tool() {
-    local t="$1"
-    if ! command -v "$t" &>/dev/null; then
-        echo -e "${YELLOW}Warning:${RESET} $t not found in PATH."
-        return 1
-    fi
-    return 0
+# ---------- CLEANUP STATE AND TRAP (ADDED FOR SAFETY) ----------
+MON_IFACE_TO_RESTORE=""
+
+restore_managed_mode(){
+  local IFACE="$1"
+  if check_tool iw; then
+    sudo ip link set "$IFACE" down || true
+    sudo iw dev "$IFACE" set type managed 2>/dev/null || true
+    sudo ip link set "$IFACE" up || true
+    info "Restored $IFACE to managed mode."
+  elif check_tool airmon-ng; then
+    sudo airmon-ng stop "$IFACE" >/dev/null 2>&1 || true
+    info "Stopped monitor interface via airmon-ng."
+  fi
 }
 
-function check_dependencies() {
-    local deps=(python3 tcpdump airodump-ng iw ip airmon-ng)
-    echo "Checking dependencies..."
-    local missing=()
-    for d in "${deps[@]}"; do
-        if ! check_tool "$d"; then
-            missing+=("$d")
-        fi
-    done
-    if [ "${#missing[@]}" -ne 0 ]; then
-        echo -e "${YELLOW}Missing tools:${RESET} ${missing[*]}"
-        echo "Install them with your package manager (apt/pacman/yum) or from aircrack-ng suite where appropriate."
-    else
-        echo -e "${GREEN}All required tools appear present.${RESET}"
-    fi
-}
-
-function detector_exists() {
-    if [ ! -f "$SCRIPT_DIR/$DETECTOR" ]; then
-        die "Detector script not found: $SCRIPT_DIR/$DETECTOR"
-    fi
-}
-
-# Attempt to restore interface if we changed anything
-function cleanup() {
+cleanup_on_exit() {
     local rc=$?
-    if $IFACE_CHANGED && [ -n "$MON_IFACE" ]; then
-        echo "Attempting to restore $MON_IFACE to managed mode..."
-        if command -v iw &>/dev/null; then
-            sudo ip link set "$MON_IFACE" down || true
-            sudo iw dev "$MON_IFACE" set type managed 2>/dev/null || true
-            sudo ip link set "$MON_IFACE" up || true
-        elif command -v airmon-ng &>/dev/null; then
-            sudo airmon-ng stop "$MON_IFACE" 2>/dev/null || true
-        fi
-        echo "Restore attempted."
+    # Ensure this runs only once or when necessary
+    if [ -n "$MON_IFACE_TO_RESTORE" ]; then
+        warn "Script interrupted. Attempting to restore $MON_IFACE_TO_RESTORE."
+        restore_managed_mode "$MON_IFACE_TO_RESTORE" || true
     fi
-    exit $rc
+    # Only if the script ends via trap (INT/TERM), then exit
+    # EXIT signal is handled by the main flow or the shell itself, 
+    # but we trap INT/TERM for the cleanup function.
+    if [ $rc -ne 0 ]; then
+        exit $rc
+    fi
 }
-trap cleanup INT TERM EXIT
+trap cleanup_on_exit INT TERM
 
-function interface_setup() {
-    read -r -p "Interface name (default wlan0): " IFACE
-    IFACE=${IFACE:-wlan0}
-
-    echo "Checking interface: $IFACE"
-    if ! ip link show "$IFACE" &>/dev/null; then
-        die "Interface $IFACE does not exist."
-    fi
-
-    echo "Attempting to set $IFACE to monitor mode (non-destructive)..."
-    # Try airmon-ng first (it handles dependencies)
-    if command -v airmon-ng &>/dev/null; then
-        echo "Using airmon-ng to start monitor mode (safer for complex drivers)..."
-        sudo airmon-ng check kill >/dev/null 2>&1 || true
-        # airmon-ng may create interface like wlan0mon
-        if sudo airmon-ng start "$IFACE"; then
-            # try to find resulting monitor interface
-            MON_IFACE=$(iw dev | awk '/Interface/ {print $2}' | grep -E "^${IFACE}|mon" | head -n1 || true)
-            IFACE_CHANGED=true
-            echo -e "${GREEN}Monitor interface likely: ${MON_IFACE:-$IFACE}${RESET}"
-            return 0
-        else
-            echo "airmon-ng start failed or is not ideal; falling back to iw."
-        fi
-    fi
-
-    # Fallback to iw
-    if command -v iw &>/dev/null; then
-        sudo ip link set "$IFACE" down || true
-        if sudo iw dev "$IFACE" set type monitor 2>/dev/null; then
-            sudo ip link set "$IFACE" up || true
-            MON_IFACE="$IFACE"
-            IFACE_CHANGED=true
-            echo -e "${GREEN}Set $IFACE to monitor mode.${RESET}"
-            return 0
-        else
-            echo "iw failed to set monitor mode (driver may not support it)."
-            sudo ip link set "$IFACE" up || true
-            return 1
-        fi
-    fi
-
-    die "No method available to set monitor mode. Install 'airmon-ng' or 'iw'."
+# ---------- NETWORK HELPERS ----------
+default_iface(){
+  ip -o link show | awk -F': ' '{print $2}' | grep -E 'wl|wlan' | head -n1 || echo "wlan0"
 }
 
-function passive_scan() {
-    read -r -p "Enter monitor interface (e.g., wlan0mon) [default wlan0]: " MON
-    MON=${MON:-wlan0}
-    if ! ip link show "$MON" &>/dev/null; then
-        echo "Interface $MON not found. Try interface_setup first."
-        read -n1 -s -r -p "Press any key to continue..."
-        return
+set_monitor_mode(){
+  local IFACE="$1"
+  if ! ip link show "$IFACE" >/dev/null 2>&1; then die "Interface $IFACE not found."; fi
+
+  local MON
+  if check_tool airmon-ng; then
+    sudo airmon-ng check kill >/dev/null 2>&1 || true
+    sudo airmon-ng start "$IFACE" >/dev/null 2>&1 || warn "airmon-ng failed; using iw fallback."
+    MON=$(iw dev | awk '/Interface/ {print $2}' | grep -E "^${IFACE}mon|mon0" | head -n1 || true)
+    if [ -n "$MON" ]; then
+        MON_IFACE_TO_RESTORE="$MON" # <--- NEW: Set the interface to be cleaned up
+        echo "$MON"
+        return 0
     fi
+  fi
 
-    if command -v airodump-ng &>/dev/null; then
-        echo "Running airodump-ng on $MON. Press Ctrl+C to stop."
-        sudo airodump-ng "$MON"
-    else
-        echo "airodump-ng not available. Using tcpdump to capture management frames (limited)."
-        echo "Capturing 60 seconds of traffic to $LOG_DIR/scan_$(date +%Y%m%d_%H%M%S).pcap"
-        sudo timeout 60 tcpdump -i "$MON" -w "${LOG_DIR}/scan_$(date +%Y%m%d_%H%M%S).pcap" || true
-    fi
-    read -n1 -s -r -p "Press any key to continue..."
+  if check_tool iw; then
+    sudo ip link set "$IFACE" down || true
+    if sudo iw dev "$IFACE" set type monitor 2>/dev/null; then
+      sudo ip link set "$IFACE" up || true
+      MON_IFACE_TO_RESTORE="$IFACE" # <--- NEW: Set the interface to be cleaned up
+      echo "$IFACE"; return 0
+    fi
+    sudo ip link set "$IFACE" up || true
+    warn "Monitor mode not supported."
+  fi
+  return 1
 }
 
-function run_detector_live() {
-    detector_exists
-    read -r -p "Monitor interface for live sniff (e.g., wlan0mon) [default wlan0]: " MON
-    MON=${MON:-wlan0}
-    if ! ip link show "$MON" &>/dev/null; then
-        die "Interface $MON not present. Run Interface setup first."
-    fi
-
-    read -r -p "Threshold frames to alert [default 10]: " THR
-    THR=${THR:-10}
-    read -r -p "Time window seconds [default 5]: " WIN
-    WIN=${WIN:-5}
-    LOG="${LOG_DIR}/wiper_pro_live_$(date +%Y%m%d_%H%M%S).log"
-    JSON="${LOG_DIR}/alerts_live_$(date +%Y%m%d_%H%M%S).json"
-    echo "Starting detector (live). Logs -> $LOG JSON alerts -> $JSON"
-
-    # Use sudo only when necessary; propagate environment minimally
-    sudo -E python3 "$SCRIPT_DIR/$DETECTOR" --iface "$MON" --threshold "$THR" --window "$WIN" --logfile "$LOG" --json-alerts "$JSON"
+# ---------- MENU OPTIONS ----------
+menu_interface_setup(){
+  local def=$(default_iface)
+  read -r -p "Interface name [default: ${def}]: " IFACE
+  IFACE=${IFACE:-$def}
+  info "Enabling monitor mode on $IFACE..."
+  local MON
+  MON=$(set_monitor_mode "$IFACE" || true)
+  if [ -n "$MON" ]; then
+    info "Monitor interface active: $MON"
+  else
+    warn "Monitor mode setup failed."
+  fi
+  read -n1 -s -r -p "Press any key to return..."
 }
 
-function run_detector_pcap() {
-    detector_exists
-    read -r -p "Path to PCAP file for offline testing: " PCAP
-    if [ ! -f "$PCAP" ]; then
-        echo "PCAP not found."
-        read -n1 -s -r -p "Press any key to continue..."
-        return
-    fi
-    read -r -p "Threshold frames to alert [default 10]: " THR
-    THR=${THR:-10}
-    read -r -p "Time window seconds [default 5]: " WIN
-    WIN=${WIN:-5}
-    LOG="${LOG_DIR}/wiper_pro_offline_$(date +%Y%m%d_%H%M%S).log"
-    JSON="${LOG_DIR}/alerts_offline_$(date +%Y%m%d_%H%M%S).json"
-    echo "Processing PCAP: $PCAP -> log: $LOG json: $JSON"
-    python3 "$SCRIPT_DIR/$DETECTOR" --pcap "$PCAP" --threshold "$THR" --window "$WIN" --logfile "$LOG" --json-alerts "$JSON"
-    echo "Done. Check JSON alerts: $JSON"
-    read -n1 -s -r -p "Press any key to continue..."
+menu_passive_scan(){
+  read -r -p "Monitor interface [default: wlan0]: " MON
+  MON=${MON:-wlan0}
+
+  if ! ip link show "$MON" >/dev/null 2>&1; then
+    warn "Interface $MON not found. Run setup first."
+    read -n1 -s -r -p "Press any key..."
+    return
+  fi
+
+  if check_tool airodump-ng; then
+    info "Launching airodump-ng on $MON (Ctrl+C to stop)"
+    # Pass the interface to trap, so it cleans up if interrupted during scan
+    MON_IFACE_TO_RESTORE="$MON" # <--- Safety Check: Ensure trap variable is set
+    sudo airodump-ng "$MON"
+  else
+    local PCAP="${LOG_DIR}/scan_$(date +%Y%m%d_%H%M%S).pcap"
+    info "Capturing traffic for 60s -> $PCAP"
+    sudo timeout 60 tcpdump -i "$MON" -w "$PCAP" || true
+    info "Saved capture to: $PCAP"
+  fi
+  MON_IFACE_TO_RESTORE="" # <--- Clear the trap variable after scan finishes normally
+  read -n1 -s -r -p "Press any key to return..."
 }
 
-function list_logs() {
-    ls -lh "$LOG_DIR" 2>/dev/null || echo "Log directory is empty or does not exist."
-    read -n1 -s -r -p "Press any key to continue..."
+menu_analyze_pcap(){
+  read -r -p "Path to PCAP file: " PCAP
+  [ ! -f "$PCAP" ] && die "PCAP file not found."
+
+  local LOG="${LOG_DIR}/analysis_$(date +%Y%m%d_%H%M%S).log"
+  local JSON="${LOG_DIR}/alerts_$(date +%Y%m%d_%H%M%S).json"
+
+  info "Analyzing $PCAP..."
+  python3 - "$PCAP" "$LOG" "$JSON" <<'PYCODE'
+# =====================================================================
+# Embedded Python Analyzer (Defensive Only)
+# Detects beacon flood or excessive management anomalies
+# =====================================================================
+import sys, os, json, logging, time
+from collections import defaultdict, deque
+
+try:
+    from scapy.all import rdpcap, Dot11, Dot11Elt, Dot11Beacon
+except ImportError:
+    print("Scapy not installed. Run: pip3 install scapy")
+    sys.exit(1)
+
+pcap, logf, jsonf = sys.argv[1], sys.argv[2], sys.argv[3]
+os.makedirs(os.path.dirname(logf), exist_ok=True)
+
+logging.basicConfig(filename=logf, level=logging.INFO,
+                    format="%(asctime)s %(levelname)s: %(message)s")
+print(f"Analyzing {pcap} ...")
+
+AP_STATE = defaultdict(dict)
+RECENT = deque(maxlen=5000)
+
+def get_ssid(pkt):
+    try:
+        el = pkt.getlayer(Dot11Elt)
+        while el:
+            if el.ID == 0:
+                return el.info.decode(errors="ignore")
+            el = el.payload.getlayer(Dot11Elt)
+    except Exception:
+        return "<hidden>"
+    return "<hidden>"
+
+def analyze(pkt):
+    if not pkt.haslayer(Dot11Beacon): return
+    ssid = get_ssid(pkt)
+    bssid = pkt.addr3
+    if not bssid: return
+
+    AP_STATE[ssid][bssid] = {"seen": time.time()}
+    RECENT.append((time.time(), ssid, bssid))
+
+    # Simple detection: repeated beacon bursts
+    # Note: Time check here is based on local system time, which is not precise for PCAP analysis
+    # but serves as a placeholder logic for the embedded script example.
+    recent = [x for x in RECENT if x[0] > time.time() - 5 and x[2] == bssid] 
+    if len(recent) > 20:
+        alert = {"time": time.time(), "type": "beacon_flood",
+                 "ssid": ssid, "bssid": bssid}
+        logging.warning(f"Beacon flood suspected: {ssid} ({bssid})")
+        with open(jsonf, "a") as f:
+            f.write(json.dumps(alert) + "\n")
+
+pkts = rdpcap(pcap)
+for p in pkts: analyze(p)
+print(f"Done. Alerts written to {jsonf}")
+# =====================================================================
+PYCODE
+
+  read -n1 -s -r -p "Press any key to return..."
 }
 
-function show_menu() {
-    check_root
-    while true; do
-        clear
-        banner
-        check_dependencies
-        echo -e "${YELLOW}Select an action:${RESET}"
-        echo "1) Interface setup -> set monitor mode"
-        echo "2) Passive scan (airodump / tcpdump) for target discovery"
-        echo "3) Run PRO Detector (live sniff)"
-        echo "4) Run PRO Detector (offline PCAP test)"
-        echo "5) List logs"
-        echo "6) Exit"
-        read -r -p "Choice: " CH
-        case "$CH" in
-            1) interface_setup ;;
-            2) passive_scan ;;
-            3) run_detector_live ;;
-            4) run_detector_pcap ;;
-            5) list_logs ;;
-            6) echo "Bye"; exit 0 ;;
-            *) echo "Invalid" ; sleep 1 ;;
-        esac
-    done
+menu_list_logs(){
+  ls -lh "$LOG_DIR" 2>/dev/null || echo "No logs yet."
+  read -n1 -s -r -p "Press any key..."
 }
 
-# Start
+menu_exit(){
+  # Restore all active monitor interfaces before final exit
+  info "Restoring all monitored interfaces before exit..."
+  for i in $(iw dev | awk '/Interface/{print $2}'); do
+    restore_managed_mode "$i" || true
+  done
+  info "Goodbye!"
+  exit 0
+}
+
+# ---------- MAIN MENU ----------
+show_menu(){
+  ensure_root_prompt
+  while true; do
+    banner
+    check_dependencies
+    echo -e "${YELLOW}Select an action:${RESET}"
+    echo "1) Setup monitor mode"
+    echo "2) Passive scan"
+    echo "3) Analyze PCAP (offline mode)"
+    echo "4) View logs"
+    echo "5) Exit"
+    read -r -p "Choice [1-5]: " CH
+    case "$CH" in
+      1) menu_interface_setup ;;
+      2) menu_passive_scan ;;
+      3) menu_analyze_pcap ;;
+      4) menu_list_logs ;;
+      5) menu_exit ;;
+      *) warn "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+
+# ---------- START ----------
 show_menu
